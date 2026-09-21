@@ -1,0 +1,7 @@
+torch==2.1.0
+torchvision==0.16.0
+open_clip_torch==2.31.0
+scikit-learn==1.0.2
+Pillow>=9
+numpy<2
+
