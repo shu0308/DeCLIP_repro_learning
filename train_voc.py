@@ -23,6 +23,12 @@ def parse_args():
                         help="Use all training images at every stage while supervising only current classes")
     parser.add_argument("--oracle-old-labels", action="store_true",
                         help="Oracle ablation: supervise and update old prompts with ground-truth old labels")
+    parser.add_argument("--reliable-old-labels", action="store_true",
+                        help="Use only confidence-screened real old positives, with weak loss weight")
+    parser.add_argument("--old-confidence-threshold", type=float, default=0.80,
+                        help="Minimum pre-update old-class probability for old-label supervision")
+    parser.add_argument("--old-positive-loss-weight", type=float, default=0.20,
+                        help="Weak loss weight for each retained old positive label")
     parser.add_argument("--pretrained", default="openai", help="OpenCLIP pretrained tag or local checkpoint")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -80,7 +86,8 @@ def main():
         # but exposes all already-seen ground-truth labels and updates their
         # prompts as an upper-bound measurement for reliable old-label signals.
         train_indices = (list(range(len(protocol.classes))) if args.joint_upper_bound
-                         else (protocol.seen(task_id) if args.oracle_old_labels else current))
+                         else (protocol.seen(task_id)
+                               if (args.oracle_old_labels or args.reliable_old_labels) else current))
         train_set = VOCMultiLabel(args.data_root, "trainval", train_tf, current,
                                   require_current_positive=not (args.all_images_per_task or args.joint_upper_bound))
         calibration_set = None
@@ -124,9 +131,17 @@ def main():
                 train_set, torch.utils.data.Subset) else train_set.labels[:, current]
             negative_weight = (1.0 + labels.sum(0) / len(labels)).tolist()
             print(f"task={task_id + 1} adaptive_negative_weights={negative_weight}")
-        for train_log in train_task(model, train_loader, train_indices, optimizer, device, args.epochs,
-                                    not args.no_amp, negative_weight):
-            print(f"task={task_id + 1}/{len(tasks)} epoch={train_log['epoch']} loss={train_log['loss']:.5f}")
+        old_indices = [] if task_id == 0 or args.joint_upper_bound else protocol.seen(task_id - 1)
+        for train_log in train_task(
+                model, train_loader, train_indices, optimizer, device, args.epochs,
+                not args.no_amp, negative_weight, old_class_indices=old_indices,
+                reliable_old_labels=args.reliable_old_labels,
+                old_confidence_threshold=args.old_confidence_threshold,
+                old_positive_loss_weight=args.old_positive_loss_weight):
+            suffix = (f" reliable_old_ratio={train_log['reliable_old_ratio']:.3f}"
+                      if 'reliable_old_ratio' in train_log else '')
+            print(f"task={task_id + 1}/{len(tasks)} epoch={train_log['epoch']} "
+                  f"loss={train_log['loss']:.5f}{suffix}")
         seen = current if args.joint_upper_bound else protocol.seen(task_id)
         evaluation_task = 1 if args.joint_upper_bound else task_id + 1
         test_set = VOCMultiLabel(args.data_root, "test", val_tf, seen,
@@ -149,6 +164,7 @@ def main():
             metrics["calibration_objective"] = args.calibration_objective
             metrics["calibration_score"] = calibration_score
         metrics["oracle_old_labels"] = args.oracle_old_labels
+        metrics["reliable_old_labels"] = args.reliable_old_labels
         metrics["class_AP"] = {protocol.classes[i]: ap for i, ap in zip(seen, metrics.pop("AP"))}
         history.append({"task": task_id + 1, "classes": [protocol.classes[i] for i in current], **metrics})
         print(history[-1])

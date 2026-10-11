@@ -20,28 +20,52 @@ def _class_chunks(class_indices, class_chunk_size):
 
 
 def train_task(model, loader, class_indices, optimizer, device, epochs=5, amp=True,
-               negative_weight=1.0, class_chunk_size=0):
+               negative_weight=1.0, class_chunk_size=0, old_class_indices=(),
+               reliable_old_labels=False, old_confidence_threshold=0.80,
+               old_positive_loss_weight=0.20):
     class_indices = list(class_indices)
     negative_weight = torch.as_tensor(negative_weight, dtype=torch.float32)
     if negative_weight.numel() not in (1, len(class_indices)) or (negative_weight <= 0).any():
         raise ValueError("negative_weight must contain one or one-per-class positive value")
     chunks = _class_chunks(class_indices, class_chunk_size)
+    old_class_indices = list(old_class_indices)
+    old_positions = [class_indices.index(index) for index in old_class_indices]
+    if not 0.0 <= old_confidence_threshold <= 1.0:
+        raise ValueError("old_confidence_threshold must be in [0, 1]")
+    if old_positive_loss_weight < 0:
+        raise ValueError("old_positive_loss_weight must be non-negative")
     model.freeze_except(class_indices)
     model.train()
     scaler = GradScaler(enabled=amp and device.type == "cuda")
     for epoch in range(epochs):
         total_loss = 0.0
+        reliable_old_count = 0
+        old_positive_count = 0
         for images, labels, _ in loader:
             images = images.to(device, non_blocking=True)
             targets = (1 - labels[:, class_indices]).to(device, non_blocking=True).long()
             negative_weight_device = negative_weight.to(device)
             if negative_weight_device.numel() > 1:
                 negative_weight_device = negative_weight_device.view(1, -1)
-            full_weights = torch.where(targets == 1, negative_weight_device, 1.0)
-            denominator = full_weights.sum()
             optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
                 shared = model._shared_visual_prefix(images)
+                if reliable_old_labels and old_class_indices:
+                    old_logits = model.forward_from_shared(shared, old_class_indices,
+                                                           ast_temperature=1.0)
+                    old_probabilities = old_logits.softmax(-1)[..., 0]
+                    old_targets = labels[:, old_class_indices].to(device, non_blocking=True)
+                    reliable_old = ((old_targets > 0.5) &
+                                    (old_probabilities >= old_confidence_threshold))
+                    reliable_old_count += reliable_old.sum().item()
+                    old_positive_count += (old_targets > 0.5).sum().item()
+            full_weights = torch.where(targets == 1, negative_weight_device, 1.0)
+            if reliable_old_labels and old_class_indices:
+                # Do not make partial old negatives into hard supervision.
+                # Only confidence-screened, real old positives get a weak loss.
+                full_weights[:, old_positions] = (
+                    reliable_old.to(full_weights.dtype) * old_positive_loss_weight)
+            denominator = full_weights.sum().clamp_min(1.0)
             batch_loss = 0.0
             for start, end, chunk in chunks:
                 chunk_targets = targets[:, start:end]
@@ -58,7 +82,10 @@ def train_task(model, loader, class_indices, optimizer, device, epochs=5, amp=Tr
             scaler.step(optimizer)
             scaler.update()
             total_loss += batch_loss * images.shape[0]
-        yield {"epoch": epoch + 1, "loss": total_loss / len(loader.dataset)}
+        log = {"epoch": epoch + 1, "loss": total_loss / len(loader.dataset)}
+        if reliable_old_labels and old_class_indices:
+            log["reliable_old_ratio"] = reliable_old_count / max(old_positive_count, 1)
+        yield log
 
 
 @torch.no_grad()
