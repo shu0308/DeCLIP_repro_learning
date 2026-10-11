@@ -22,7 +22,7 @@ def _class_chunks(class_indices, class_chunk_size):
 def train_task(model, loader, class_indices, optimizer, device, epochs=5, amp=True,
                negative_weight=1.0, class_chunk_size=0, old_class_indices=(),
                reliable_old_labels=False, old_confidence_threshold=0.80,
-               old_positive_loss_weight=0.20):
+               old_positive_loss_weight=0.20, old_logit_margin=0.0):
     class_indices = list(class_indices)
     negative_weight = torch.as_tensor(negative_weight, dtype=torch.float32)
     if negative_weight.numel() not in (1, len(class_indices)) or (negative_weight <= 0).any():
@@ -34,6 +34,8 @@ def train_task(model, loader, class_indices, optimizer, device, epochs=5, amp=Tr
         raise ValueError("old_confidence_threshold must be in [0, 1]")
     if old_positive_loss_weight < 0:
         raise ValueError("old_positive_loss_weight must be non-negative")
+    if old_logit_margin < 0:
+        raise ValueError("old_logit_margin must be non-negative")
     model.freeze_except(class_indices)
     model.train()
     scaler = GradScaler(enabled=amp and device.type == "cuda")
@@ -54,9 +56,14 @@ def train_task(model, loader, class_indices, optimizer, device, epochs=5, amp=Tr
                     old_logits = model.forward_from_shared(shared, old_class_indices,
                                                            ast_temperature=1.0)
                     old_probabilities = old_logits.softmax(-1)[..., 0]
+                    # A high positive probability alone can be overconfident.
+                    # Require its positive prompt score to also beat the paired
+                    # negative prompt score by a meaningful margin.
+                    old_margins = old_logits[..., 0] - old_logits[..., 1]
                     old_targets = labels[:, old_class_indices].to(device, non_blocking=True)
                     reliable_old = ((old_targets > 0.5) &
-                                    (old_probabilities >= old_confidence_threshold))
+                                    (old_probabilities >= old_confidence_threshold) &
+                                    (old_margins >= old_logit_margin))
                     reliable_old_count += reliable_old.sum().item()
                     old_positive_count += (old_targets > 0.5).sum().item()
             full_weights = torch.where(targets == 1, negative_weight_device, 1.0)

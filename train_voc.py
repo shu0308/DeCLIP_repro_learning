@@ -29,6 +29,8 @@ def parse_args():
                         help="Minimum pre-update old-class probability for old-label supervision")
     parser.add_argument("--old-positive-loss-weight", type=float, default=0.20,
                         help="Weak loss weight for each retained old positive label")
+    parser.add_argument("--old-logit-margin", type=float, default=0.0,
+                        help="Minimum positive-minus-negative prompt logit margin for a retained old label")
     parser.add_argument("--pretrained", default="openai", help="OpenCLIP pretrained tag or local checkpoint")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -137,7 +139,8 @@ def main():
                 not args.no_amp, negative_weight, old_class_indices=old_indices,
                 reliable_old_labels=args.reliable_old_labels,
                 old_confidence_threshold=args.old_confidence_threshold,
-                old_positive_loss_weight=args.old_positive_loss_weight):
+                old_positive_loss_weight=args.old_positive_loss_weight,
+                old_logit_margin=args.old_logit_margin):
             suffix = (f" reliable_old_ratio={train_log['reliable_old_ratio']:.3f}"
                       if 'reliable_old_ratio' in train_log else '')
             print(f"task={task_id + 1}/{len(tasks)} epoch={train_log['epoch']} "
