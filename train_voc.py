@@ -21,6 +21,8 @@ def parse_args():
                         help="Train all classes jointly with full labels as a non-incremental upper bound")
     parser.add_argument("--all-images-per-task", action="store_true",
                         help="Use all training images at every stage while supervising only current classes")
+    parser.add_argument("--oracle-old-labels", action="store_true",
+                        help="Oracle ablation: supervise and update old prompts with ground-truth old labels")
     parser.add_argument("--pretrained", default="openai", help="OpenCLIP pretrained tag or local checkpoint")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -73,6 +75,12 @@ def main():
     history = []
     tasks = [list(range(len(protocol.classes)))] if args.joint_upper_bound else protocol.tasks
     for task_id, current in enumerate(tasks):
+        # The standard MLCIL setting updates only prompts for newly introduced
+        # labels.  The oracle switch keeps the same current-task image stream,
+        # but exposes all already-seen ground-truth labels and updates their
+        # prompts as an upper-bound measurement for reliable old-label signals.
+        train_indices = (list(range(len(protocol.classes))) if args.joint_upper_bound
+                         else (protocol.seen(task_id) if args.oracle_old_labels else current))
         train_set = VOCMultiLabel(args.data_root, "trainval", train_tf, current,
                                   require_current_positive=not (args.all_images_per_task or args.joint_upper_bound))
         calibration_set = None
@@ -108,7 +116,7 @@ def main():
         train_loader = DataLoader(train_set, args.batch_size, shuffle=sampler is None, sampler=sampler,
                                   generator=generator if sampler is None else None,
                                   num_workers=args.workers, pin_memory=True, drop_last=False)
-        optimizer = torch.optim.Adam(model.prompt_parameters(current), lr=args.lr,
+        optimizer = torch.optim.Adam(model.prompt_parameters(train_indices), lr=args.lr,
                                      betas=(0.9, 0.999), weight_decay=args.weight_decay)
         negative_weight = args.negative_loss_weight
         if args.adaptive_negative_weight:
@@ -116,7 +124,7 @@ def main():
                 train_set, torch.utils.data.Subset) else train_set.labels[:, current]
             negative_weight = (1.0 + labels.sum(0) / len(labels)).tolist()
             print(f"task={task_id + 1} adaptive_negative_weights={negative_weight}")
-        for train_log in train_task(model, train_loader, current, optimizer, device, args.epochs,
+        for train_log in train_task(model, train_loader, train_indices, optimizer, device, args.epochs,
                                     not args.no_amp, negative_weight):
             print(f"task={task_id + 1}/{len(tasks)} epoch={train_log['epoch']} loss={train_log['loss']:.5f}")
         seen = current if args.joint_upper_bound else protocol.seen(task_id)
@@ -140,6 +148,7 @@ def main():
         if calibration_score is not None:
             metrics["calibration_objective"] = args.calibration_objective
             metrics["calibration_score"] = calibration_score
+        metrics["oracle_old_labels"] = args.oracle_old_labels
         metrics["class_AP"] = {protocol.classes[i]: ap for i, ap in zip(seen, metrics.pop("AP"))}
         history.append({"task": task_id + 1, "classes": [protocol.classes[i] for i in current], **metrics})
         print(history[-1])
