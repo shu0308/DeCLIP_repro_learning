@@ -22,7 +22,8 @@ def _class_chunks(class_indices, class_chunk_size):
 def train_task(model, loader, class_indices, optimizer, device, epochs=5, amp=True,
                negative_weight=1.0, class_chunk_size=0, old_class_indices=(),
                reliable_old_labels=False, old_confidence_threshold=0.80,
-               old_positive_loss_weight=0.20, old_logit_margin=0.0):
+               old_positive_loss_weight=0.20, old_logit_margin=0.0,
+               old_label_cache=None):
     class_indices = list(class_indices)
     negative_weight = torch.as_tensor(negative_weight, dtype=torch.float32)
     if negative_weight.numel() not in (1, len(class_indices)) or (negative_weight <= 0).any():
@@ -30,6 +31,10 @@ def train_task(model, loader, class_indices, optimizer, device, epochs=5, amp=Tr
     chunks = _class_chunks(class_indices, class_chunk_size)
     old_class_indices = list(old_class_indices)
     old_positions = [class_indices.index(index) for index in old_class_indices]
+    if reliable_old_labels and old_label_cache is not None:
+        raise ValueError("choose either the legacy oracle filter or pseudo-label cache")
+    if old_label_cache is not None and not old_class_indices:
+        raise ValueError("old_class_indices are required for an old-label cache")
     if not 0.0 <= old_confidence_threshold <= 1.0:
         raise ValueError("old_confidence_threshold must be in [0, 1]")
     if old_positive_loss_weight < 0:
@@ -43,7 +48,7 @@ def train_task(model, loader, class_indices, optimizer, device, epochs=5, amp=Tr
         total_loss = 0.0
         reliable_old_count = 0
         old_positive_count = 0
-        for images, labels, _ in loader:
+        for images, labels, image_ids in loader:
             images = images.to(device, non_blocking=True)
             targets = (1 - labels[:, class_indices]).to(device, non_blocking=True).long()
             negative_weight_device = negative_weight.to(device)
@@ -72,6 +77,12 @@ def train_task(model, loader, class_indices, optimizer, device, epochs=5, amp=Tr
                 # Only confidence-screened, real old positives get a weak loss.
                 full_weights[:, old_positions] = (
                     reliable_old.to(full_weights.dtype) * old_positive_loss_weight)
+            if old_label_cache is not None:
+                cached = [old_label_cache[image_id] for image_id in image_ids]
+                old_targets = torch.stack([row[0] for row in cached]).to(device)
+                old_weights = torch.stack([row[1] for row in cached]).to(device)
+                targets[:, old_positions] = old_targets
+                full_weights[:, old_positions] = old_weights
             denominator = full_weights.sum().clamp_min(1.0)
             batch_loss = 0.0
             for start, end, chunk in chunks:
